@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -24,6 +25,9 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "NightCoopUpdater"
 GAME_EXE = Path("bin") / "x64" / "Cyberpunk2077.exe"
 MAX_BYTES = 1 << 30  # 1 Go : aucun mod sérieux ne dépasse ça
+APP_VERSION = "1.0.0"  # à augmenter à chaque release GitHub (l'étiquette de la release doit être plus haute)
+APP_REPO = "Surfy-creator/CyberHub"
+APP_EXE = "CyberModHub.exe"  # nom du fichier joint à chaque release
 NIGHTCOOP = {"name": "NightCoop", "url": "https://nightcoop.net/download.html"}
 NC_DIR = Path("red4ext") / "plugins" / "NightCoop"
 # Réglages de synchro lus par NightCoop au démarrage du jeu (switches.txt, « nom = on|off »).
@@ -229,6 +233,44 @@ def set_patch(game_dir, name, on):
         f.unlink()  # plus aucun réglage : le mod repart sur ses valeurs par défaut
 
 
+def newer(a, b):
+    """Vrai si la version a est strictement plus récente que b (1.0 et 1.0.0 sont égales)."""
+    ka, kb = version_key(a), version_key(b)
+    n = max(len(ka), len(kb))
+    return ka + (0,) * (n - len(ka)) > kb + (0,) * (n - len(kb))
+
+
+def app_update():
+    """Nouvelle version du hub publiée sur GitHub : {"version", "file", "sha256"}, ou None."""
+    try:
+        rel = json.loads(fetch(f"https://api.github.com/repos/{APP_REPO}/releases/latest"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:  # aucune release publiée
+            return None
+        raise
+    if not newer(rel["tag_name"], APP_VERSION):
+        return None
+    asset = next((a for a in rel.get("assets", []) if a["name"] == APP_EXE), None)
+    digest = (asset or {}).get("digest") or ""
+    if not digest.startswith("sha256:") or urlparse(asset["browser_download_url"]).hostname != "github.com":
+        raise RuntimeError(f"La release {rel['tag_name']} n'a pas de {APP_EXE} avec empreinte SHA-256.")
+    return {"version": rel["tag_name"], "file": asset["browser_download_url"], "sha256": digest[7:]}
+
+
+def install_app(data, info, exe):
+    """Remplace l'exe en cours par la nouvelle version (vérifiée) ; l'ancien reste en .old jusqu'au prochain lancement."""
+    if hashlib.sha256(data).hexdigest() != info["sha256"].lower():
+        raise RuntimeError("SHA-256 incorrect : fichier corrompu ou modifié, mise à jour annulée.")
+    if data[:2] != b"MZ":
+        raise RuntimeError("Le fichier téléchargé n'est pas un exécutable Windows.")
+    exe = Path(exe)
+    new, old = exe.with_name(exe.name + ".new"), exe.with_name(exe.name + ".old")
+    new.write_bytes(data)
+    old.unlink(missing_ok=True)
+    os.replace(exe, old)  # Windows permet de renommer un exe en cours d'exécution, pas de l'écraser
+    os.replace(new, exe)
+
+
 def startup_command():
     if getattr(sys, "frozen", False):  # version .exe (PyInstaller)
         return f'"{sys.executable}" --startup'
@@ -270,6 +312,11 @@ def run_gui(startup=False):
     cfg = load_config()
     infos = {}  # url -> résultat de resolve() ou l'exception
     state = {"busy": False}
+    if getattr(sys, "frozen", False):
+        try:
+            Path(sys.executable + ".old").unlink(missing_ok=True)  # reste d'une mise à jour du hub
+        except OSError:
+            pass
     if autostart_enabled():
         set_autostart(True)  # garde la clé alignée sur l'emplacement actuel de l'exe
 
@@ -302,8 +349,58 @@ def run_gui(startup=False):
     head = tk.Frame(root, bg=BG, padx=24, pady=16)
     head.pack(fill="x")
     label(head, "CYBER MOD HUB", 26, YELLOW, True).pack(anchor="w")
-    label(head, "MISES À JOUR DES MODS  //  CYBERPUNK 2077", 10, CYAN).pack(anchor="w")
+    label(head, f"MISES À JOUR DES MODS  //  CYBERPUNK 2077  //  v{APP_VERSION}", 10, CYAN).pack(anchor="w")
     tk.Frame(root, bg=RED, height=2).pack(fill="x", padx=24)
+
+    # bannière affichée seulement quand une nouvelle version du hub existe sur GitHub
+    app_bar = tk.Frame(root, bg=PANEL, padx=24, pady=8)
+    app_msg = label(app_bar, "", 10, YELLOW)
+    app_msg.pack(side="left")
+    app_btn = button(app_bar, "METTRE À JOUR LE HUB", None, YELLOW, BG, 9)
+    app_btn.pack(side="right")
+
+    def show_app_update(info):
+        app_msg.configure(text=f"Nouvelle version du hub : {info['version']} (installée : v{APP_VERSION})")
+        app_btn.configure(command=lambda: apply_app_update(info))
+        app_bar.pack(fill="x", before=head)
+
+    def apply_app_update(info):
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo("Mise à jour du hub", "Hub lancé depuis les sources : fais un « git pull ».")
+            return
+        if state["busy"] or not messagebox.askyesno(
+                "Mettre à jour le hub", f"Télécharger la version {info['version']} depuis GitHub "
+                f"({APP_REPO}) et redémarrer le hub ?"):
+            return
+        state["busy"] = True
+        app_btn.configure(state="disabled")
+        refresh()
+
+        def work():
+            try:
+                data = fetch(info["file"], lambda p: root.after(0, lambda: (
+                    bar.configure(value=p), status.configure(text=f"Mise à jour du hub : {p:.0%}", fg=TEXT))))
+                install_app(data, info, sys.executable)
+            except Exception as e:
+                state["busy"] = False
+                root.after(0, lambda: (status.configure(text=f"Mise à jour du hub impossible : {e}", fg=RED),
+                                       app_btn.configure(state="normal"), refresh()))
+                return
+            root.after(0, restart)
+        threading.Thread(target=work, daemon=True).start()
+
+    def restart():
+        # PYINSTALLER_RESET_ENVIRONMENT : le nouvel exe doit s'extraire lui-même, pas réutiliser le dossier de l'ancien
+        subprocess.Popen([sys.executable], close_fds=True, env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"})
+        root.destroy()
+
+    def check_app():
+        try:
+            info = app_update()
+        except Exception:  # pas de réseau ou limite de l'API GitHub : on réessaiera au prochain lancement
+            return
+        if info:
+            root.after(0, lambda: show_app_update(info))
 
     body = tk.Frame(root, bg=BG, padx=24, pady=14)
     body.pack(fill="both")
@@ -558,6 +655,7 @@ def run_gui(startup=False):
         threading.Thread(target=work, daemon=True).start()
 
     refresh()
+    threading.Thread(target=check_app, daemon=True).start()
     if startup:
         root.iconify()  # visible dans la barre des tâches, revient au premier plan s'il a installé quelque chose
         check_all(then=lambda: run_updates(list(cfg["mods"])) if is_game_dir(cfg.get("game_dir")) else None)

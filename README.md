@@ -16,6 +16,15 @@ Télécharge `CyberModHub.exe` dans l'onglet **Releases**, ou lance depuis les s
 python mod_hub.py
 ```
 
+## Mise à jour du hub lui-même
+
+Au lancement, le hub regarde la dernière release de ce dépôt. Si elle est plus récente que sa version (affichée dans l'en-tête), une bannière jaune propose de remplacer l'exe et de redémarrer. Le fichier est vérifié par son SHA-256 avant d'être installé.
+
+Pour publier une mise à jour (mainteneur) :
+1. Augmente `APP_VERSION` dans `mod_hub.py` (par exemple `1.0.1`) et compile l'exe.
+2. Pousse le code, puis crée une release GitHub dont l'étiquette est cette version (`v1.0.1`).
+3. Joins `CyberModHub.exe` à la release, avec exactement ce nom. Sans ce fichier, les utilisateurs ne voient aucune mise à jour.
+
 ## Compiler l'exe
 
 ```
